@@ -1035,6 +1035,7 @@ int open_listenfd(char *port)
         return -1;
 
     /* Make it a listening socket ready to accept connection requests */
+    // 연결 요청을 수락할 수 있도록 듣기 소켓 준비
     if (listen(listenfd, LISTENQ) < 0) {
         close(listenfd);
 	return -1;
