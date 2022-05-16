@@ -18,9 +18,9 @@
 void doit(int fd); // 한개의 HTTP 트랜잭션 처리
 void read_requesthdrs(rio_t *rp);
 int parse_uri(char *uri, char *filename, char *cgiargs);
-void serve_static(int fd, char *filename, int filesize, char *method);
+void serve_static(int fd, char *filename, int filesize);
 void get_filetype(char *filename, char *filetype);
-void serve_dynamic(int fd, char *filename, char *cgiargs, char *method);
+void serve_dynamic(int fd, char *filename, char *cgiargs);
 void clienterror(int fd, char *cause, char *errnum, char *shortmsg, char *longmsg);
 
 /*  Rio_I/O
@@ -103,11 +103,10 @@ void doit(int fd)
   printf("Request headers:\n");
   printf("%s", buf);
   sscanf(buf, "%s %s %s", method, uri, version); // buf 변수에서 데이터(문자열)를 가져와 해당 포맷팅에 맞추어 각 변수에 저장
-  // 입력된 method가 GET이나 Head가 아니라면 error
-  // HEAD 메소드는 GET과 유사한 방식이지만, 웹 서버에서 헤더 정보 이외에는 어떠한 데이터도 보내지 않는다.
-  if (!(strcasecmp(method, "GET") == 0 || strcasecmp(method, "HEAD") == 0)) {  // method 스트링이 GET이 아니면 0이 아닌 값이 나옴
+  // 입력된 method가 GET이 아니라면 error
+  if (strcasecmp(method, "GET")) {
     clienterror(fd, method, "501", "Not implemented", "Tiny does not implement this method");
-    return;
+    return; // main함수로 복귀
   }
   
   // GET이라면 읽어들이고,다른 요청 헤더들을 무시
@@ -118,6 +117,8 @@ void doit(int fd)
   is_static = parse_uri(uri, filename, cgiargs); // cgiargs : 동적 컨텐츠의 실행파일에 들어갈 인자
   if(stat(filename, &sbuf) < 0) { // stat함수 : 파일의 정보를 얻는 함수, sbuf : 파일의 상태 및 정보를 저장할 buf 구조체, 0 : 정상, -1 : 오류(디스크에 존재하지 않을 경우)
     clienterror(fd, filename, "404", "Not found", "Tiny couldn't find this file");
+    printf("%d %s",is_static,is_static);
+
     return;
   }
   if (is_static) { // 정적파일이라면
@@ -126,14 +127,14 @@ void doit(int fd)
       clienterror(fd, filename, "403", "Forbidden", "Tiny couldn't read the file");
       return ;
     }
-    serve_static(fd, filename, sbuf.st_size, method); // st_size : 파일의 크기(byte)
+    serve_static(fd, filename, sbuf.st_size); // st_size : 파일의 크기(byte)
   }
   else { // 동적파일이라면
-    if (!(S_ISREG(sbuf.st_mode)) || !(S_IXUSR & sbuf.st_mode)) { // (일반 파일인가?) || (실행 권한이 있나?) -> 정상이면 0이 리턴되기 때문
+    if (!(S_ISREG(sbuf.st_mode)) || !(S_IXUSR & sbuf.st_mode)) { // (일반 파일 여부) || (실행 권한 여부 & 일반 파일 여부) -> 정상이면 0이 리턴되기 때문
       clienterror(fd, filename, "403", "Forbidden", "Tiny couldn't run the CGI program");
       return;
     }
-    serve_dynamic(fd, filename, cgiargs, method); // 클라이언트에게 동적 컨텐츠를 제공
+    serve_dynamic(fd, filename, cgiargs); // 클라이언트에게 동적 컨텐츠를 제공
   }
 }
 // 일반파일(Regular File) : 2진수, text 등의 데이터를 담고 있음. OS에서 이 파일을 보면 정확한 포맷은 알지 못한 채, 그저 "일련의 바이트"라고 생각한다고 함.
@@ -166,6 +167,7 @@ void read_requesthdrs(rio_t *rp)
 {
   char buf[MAXLINE];
   Rio_readlineb(rp, buf, MAXLINE);
+  printf("buf in info : %s\n", buf);
   /* 헤더의 마지막 줄은 비어있기 때문에 \r\n만 buf에 남아있다면 while문을 탈출한다 */
   /* 버퍼 rp의 마지막 끝을 만날 때까지("Content-length: %d\r\n\r\n에서 마지막 \r\n) */
   while(strcmp(buf, "\r\n")) {
@@ -207,7 +209,7 @@ int parse_uri(char *uri, char *filename, char *cgiargs)
   정적 컨텐츠를 클라이언트로 보내는 함수
    Tiny는 HTML, 무형식 텍스트 파일, GIF, PNG, JPEG로 인코딩된 영상을 정적 컨텐츠 타입을 지원
 */
-void serve_static(int fd, char *filename, int filesize, char *method)
+void serve_static(int fd, char *filename, int filesize)
 {
   int srcfd;
   char *srcp, filetype[MAXLINE], buf[MAXBUF];
@@ -223,15 +225,11 @@ void serve_static(int fd, char *filename, int filesize, char *method)
   Rio_writen(fd, buf, strlen(buf)); // connfd를 통해 clientfd에게 보냄
   printf("Response headers:\n");
   printf("%s", buf); // 서버 출력
-  
-  // 만약 메서드가 HEAD라면, 응답 본체를 만들지 않고 끝낸다.
-  if (strcasecmp(method, "HEAD") == 0)
-    return;
 
   /* Send response body to client */
   srcfd = Open(filename, O_RDONLY, 0); // 식별자 얻어오기 (읽기전용으로 연다)
   // srcp = Mmap(0, filesize, PROT_READ, MAP_PRIVATE, srcfd, 0);
-  srcp = (char*)Malloc(filesize); // 파일 크기만큼 메모리를 동적 할당 함
+  srcp = (char*)malloc(filesize); // 파일 크기만큼 메모리를 동적 할당 함
   Rio_readn(srcfd, srcp, filesize); // filename 내용을 동적할당한 메모리에 쓴다.
 
   Close(srcfd); // 매핑 후엔 식별자가 필요없으므로 파일 닫아주기 (닫지 않으면 메모리 누수 발생 가능성)
@@ -240,7 +238,7 @@ void serve_static(int fd, char *filename, int filesize, char *method)
   free(srcp);
 }
 
-void serve_dynamic(int fd, char *filename, char *cgiargs, char *method)
+void serve_dynamic(int fd, char *filename, char *cgiargs)
 {
   char buf[MAXLINE], *emptylist[] = {NULL};
 
@@ -254,10 +252,6 @@ void serve_dynamic(int fd, char *filename, char *cgiargs, char *method)
   if (Fork() == 0) { // fork의 반환값이 0이라면 (자식 프로세스) if문 수행
     /* Real server would set all CGI vars here */
     setenv("QUERY_STRING", cgiargs, 1); // setenv 시스템콜을 수행해, "QUERY_STRING"의 값을 cgiargs로 바꿔줌. 우선순위가 1이므로 기존의 값과 상관없이 값이 변경
-    
-    // 요청 메서드를 환경 변수에 추가하기
-    setenv("REQUEST_METHOD", method, 1);
-
     Dup2(fd, STDOUT_FILENO);  // CGI 프로세스의 표준 출력을 fd로 복사. STDOUT_FILENO의 값이 저장. 즉, CGI 프로세스에서 표준 출력을 하면 fd를 거쳐 클라이언트에 출력
     Execve(filename, emptylist, environ); // 파일이름이 filename인 파일을 실행함(CGI 프로그램 로드 후 실행)
   }
