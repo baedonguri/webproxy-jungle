@@ -31,14 +31,12 @@ void clienterror(int fd, char *cause, char *errnum, char *shortmsg, char *longms
 void parse_uri(char *uri, char *host, int *port, char *path);
 void build_http_header(char *http_header, char *hostname, char *path, rio_t *client_rio);
 int connect_endServer(char *hostname, int port);
-void *thread(void *vargs);
 
 int main(int argc, char **argv) {
-    int listenfd, *connfdp;
+    int listenfd, connfd;
     socklen_t clientlen;
     char clienthost[MAXLINE], clientport[MAXLINE];
     struct sockaddr_storage clientaddr;
-    pthread_t tid; // 메인 쓰레드의 주소를 저장할 tid 변수
 
     /* Check command line args */
     if (argc != 2) {
@@ -50,27 +48,14 @@ int main(int argc, char **argv) {
     
     while (1) {
       clientlen = sizeof(clientaddr);
-      
-
-      
-      connfdp = Malloc(sizeof(int)); // 메모리 동적할당
-      *connfdp = Accept(listenfd, (SA *)&clientaddr, &clientlen);
+      connfd = Accept(listenfd, (SA *)&clientaddr, &clientlen);
       
       Getnameinfo((SA *)&clientaddr, clientlen, clienthost, MAXLINE, clientport, MAXLINE, 0);
       printf("Accepted connection from (%s, %s)\n", clienthost, clientport);
-      Pthread_create(&tid, NULL, thread, (void *)connfdp); // 프로세스 내에서 쓰레드 만들기
+      doit(connfd); // 트랜잭션 수행
+      Close(connfd); // 연결 끝. 소켓 닫기
     }
     return 0;
-}
-
-void *thread(void *vargs)
-{
-  int connfd = *((int *)vargs);
-  Pthread_detach(pthread_self()); // 연결 가능한 쓰레드 tid 분리. pthread_self()를 인자로 넣으면 자신을 분리
-  Free(vargs);
-  doit(connfd);
-  Close(connfd);
-  return NULL;
 }
 
 /** 한 개의 HTTP 트랜잭션을 처리 */
