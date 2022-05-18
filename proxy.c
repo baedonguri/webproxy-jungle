@@ -15,8 +15,6 @@ static const char *host_hdr_format = "Host: %s\r\n";
 static const char *requestline_hdr_format = "GET %s HTTP/1.0\r\n";
 static const char *endof_hdr = "\r\n";
 
-
-
 static const char *host_key = "Host";
 static const char *connection_key = "Connection";
 static const char *proxy_connection_key = "Proxy-Connection";
@@ -31,15 +29,36 @@ void clienterror(int fd, char *cause, char *errnum, char *shortmsg, char *longms
 void parse_uri(char *uri, char *host, int *port, char *path);
 void build_http_header(char *http_header, char *hostname, char *path, rio_t *client_rio);
 int connect_endServer(char *hostname, int port);
-void *thread(void *vargs);
 
+void init_cache(void);
+void *thread(void *connfdp);
+int reader(int connfd, char *url);
+void writer(char *url, char *buf);
+
+
+/* 캐시 구조체 */
+typedef struct {
+  char *url; // url을 담을 변수
+  int *flag; // 캐시가 비어있는지 차 있는지 구분할 변수
+  int *cnt; // 최근 방문 순서를 나타내기 위한 변수
+  char *content; // 클라이언트에게 보낼 내용이 담겨있는 변수
+} Cache_info;
+
+Cache_info *cache; // cache 변수 선언
+int readcnt; // 세마포어를 cnt할 변수
+sem_t mutex, w;
+
+
+// argc = 2, argv[1] = 9094
 int main(int argc, char **argv) {
-    int listenfd, *connfdp;
+    int listenfd;
     socklen_t clientlen;
-    char clienthost[MAXLINE], clientport[MAXLINE];
+    char hostname[MAXLINE], port[MAXLINE];
     struct sockaddr_storage clientaddr;
-    pthread_t tid; // 메인 쓰레드의 주소를 저장할 tid 변수
+    pthread_t tid;
 
+    // 캐시 ON
+    init_cache();
     /* Check command line args */
     if (argc != 2) {
         fprintf(stderr, "usage: %s <port>\n", argv[0]);
@@ -49,37 +68,48 @@ int main(int argc, char **argv) {
     listenfd = Open_listenfd(argv[1]);  // 지정한 포트 번호로 듣기 식별자 생성
     
     while (1) {
+      // server main에서 일련의 처리를 하는 대신 스레드를 분기하여
+      // 각 연결에 대해 이후의 과정을 스레드 내에서 병렬적으로 처리한다.
+      // main은 다시 while문의 처음으로 돌아가 새로운 연결을 기다림
       clientlen = sizeof(clientaddr);
       
-
-      
-      connfdp = Malloc(sizeof(int)); // 메모리 동적할당
+      // 스레드마다 각각의 connfd를 유지하기 위해 연결할때마다 메모리를 할당하여 포인팅해줌
+      int *connfdp = Malloc(sizeof(int)); // 메모리 동적할당
       *connfdp = Accept(listenfd, (SA *)&clientaddr, &clientlen);
       
-      Getnameinfo((SA *)&clientaddr, clientlen, clienthost, MAXLINE, clientport, MAXLINE, 0);
-      printf("Accepted connection from (%s, %s)\n", clienthost, clientport);
+      Getnameinfo((SA *)&clientaddr, clientlen, hostname, MAXLINE, port, MAXLINE, 0);
+      printf("Accepted connection from (%s, %s)\n", hostname, port);
+
+      // thread 생성
+      // 연결마다 고유한 connfd를 인자로 가져감
       Pthread_create(&tid, NULL, thread, (void *)connfdp); // 프로세스 내에서 쓰레드 만들기
     }
     return 0;
 }
 
-void *thread(void *vargs)
+void *thread(void *connfdp)
 {
-  int connfd = *((int *)vargs);
+  // 각 스레드별 connfd는 입력으로 가져온 connfdp가 가리키던 할당된 위치의 fd의 값
+  int connfd = *((int *)connfdp);
   Pthread_detach(pthread_self()); // 연결 가능한 쓰레드 tid 분리. pthread_self()를 인자로 넣으면 자신을 분리
-  Free(vargs);
-  doit(connfd);
+  Free(connfdp); // connfdp는 이미 connfd를 얻어 역할을 다했으니 반납해줌
+  
+  // sequential과 같은 과정을 진행
+  doit(connfd); 
   Close(connfd);
   return NULL;
 }
 
 /** 한 개의 HTTP 트랜잭션을 처리 */
-void doit(int fd) {
+void doit(int connfd) {
     int endserver_fd;
     char buf[MAXLINE], method[MAXLINE], uri[MAXLINE], version[MAXLINE];
-    char endserver_http_header[MAXLINE];
-    char hostname[MAXLINE], path[MAXLINE];
+    char endserver_http_header[MAXLINE]; // 서버에 보낼 http 헤더 정보를 담을 공간
+    char hostname[MAXLINE], path[MAXLINE]; // hostname : IP주소를 담을 공간, path : 경로를 담을 공간
     int port;
+
+    char url[MAXLINE];
+    char content_buf[MAX_OBJECT_SIZE];
 
     /*
       Rio의 장점 : EOF을 만났을 때 short count가 나옴을 보장한다. (short count : 원하는만큼 읽겠다고 했는데 다 못 읽는 경우에 발생)
@@ -87,13 +117,20 @@ void doit(int fd) {
       server_rio : 프록시와 서버 사이의 버퍼
     */
     rio_t rio, endserver_rio;
-    Rio_readinitb(&rio, fd); // rio와 connfd 연결
+
+    Rio_readinitb(&rio, connfd); // rio와 connfd 연결
     Rio_readlineb(&rio, buf, MAXLINE); // 클라이언트가 보낸 요청라인을 읽고 분석. buf에 복사함
     sscanf(buf, "%s %s %s", method, uri, version);
+    strcpy(url, uri);
         
     if (strcasecmp(method, "GET")) {   // 결과가 0이 아닐 경우임. 즉, GET method만 처리
-        clienterror(fd, method, "501", "Not implemented", "Proxy does not implement this method");
+        clienterror(connfd, method, "501", "Not implemented", "Proxy does not implement this method");
         return;
+    }
+
+    /* cache에서 찾았을 때, cache Hit */
+    if (reader(connfd, url)) {
+      return;
     }
 
     // uri를 파싱해서 hostname, path, port번호에 값 맵핑
@@ -113,16 +150,26 @@ void doit(int fd) {
       return;
     }
 
-    Rio_readinitb(&endserver_rio, endserver_fd); // 프록시와 서버 연결
+    Rio_readinitb(&endserver_rio, endserver_fd); // server_rio 초기화. 프록시와 서버 연결
     // 프록시에서 만든 http 헤더를 endserver로 전달
     Rio_writen(endserver_fd, endserver_http_header, strlen(endserver_http_header));
     
     size_t n; // 버퍼에다 쓴 내용의 크기
+    int total_size = 0;
     while ((n = Rio_readlineb(&endserver_rio, buf, MAXLINE)) != 0) {          // end server의 응답을 buf에 받기
         printf("Proxy received %ld bytes, then send\n", n);                   // proxy에 end server에서 받은 문자수를 출력하고
-        Rio_writen(fd, buf, n);                                               // client에 end server response를 출력
-    }
+        Rio_writen(connfd, buf, n);                                               // client에 end server response를 출력
 
+        /* cache content의 최대 크기를 넘지 않으면 */
+        if (total_size+n < MAX_OBJECT_SIZE) {
+          strcpy(content_buf + total_size, buf);
+        }
+        total_size += n;
+    }
+    if (total_size < MAX_OBJECT_SIZE) {
+      writer(url, content_buf);
+    }
+    
     Close(endserver_fd); // 식별자를 다 쓴 뒤, 닫아주기
     return;
 }
@@ -161,7 +208,8 @@ void parse_uri(char *uri, char *host, int *port, char *path) {
   - Connection header
   - Proxy_Connection header
 */
-void build_http_header(char *http_header, char *hostname, char *path, rio_t *client_rio) {
+void build_http_header(char *http_header, char *hostname, char *path, rio_t *client_rio) 
+{
   char buf[MAXLINE], request_hdr[MAXLINE], other_hdr[MAXLINE], host_hdr[MAXLINE];
   
   // request line
@@ -223,3 +271,86 @@ inline int connect_endServer(char *hostname, int port) {
   return Open_clientfd(hostname, portStr); // 클라이언트 입장에서 fd 열기. 서버와 연결 설정
 }
 
+
+void init_cache(void) {
+  Sem_init(&mutex, 0, 1); // mutex를 1로 초기화 : mutex = 1
+  Sem_init(&w, 0, 1);
+  readcnt = 0;
+  cache = (Cache_info *)Malloc(sizeof(Cache_info) * 10);
+  
+  for (int i=0; i < 10; i++) {
+    cache[i].url = (char *)Malloc(sizeof(char) * 256);
+    cache[i].flag = (int *)Malloc(sizeof(int));
+    cache[i].cnt = (int *)Malloc(sizeof(int));
+    cache[i].content = (char *)Malloc(sizeof(char) * MAX_OBJECT_SIZE);
+    *(cache[i].flag) = 0;
+    *(cache[i].cnt) = 0;
+  }
+}
+
+int reader(int connfd, char *url) {
+    int return_flag = 0;
+    P(&mutex);
+    readcnt++;
+    if(readcnt == 1) {
+        P(&w);
+    }
+    V(&mutex);
+
+    for(int i = 0; i < 10; i++) {
+        if(*(cache[i].flag) == 1 && !strcmp(cache[i].url, url)) {
+            Rio_writen(connfd, cache[i].content, MAX_OBJECT_SIZE);
+            return_flag = 1;
+            *(cache[i].cnt) = 0;
+            break;
+        }
+    }    
+    
+    for(int i = 0; i < 10; i++) {
+        (*(cache[i].cnt))++;
+    }
+
+    P(&mutex);
+    readcnt--;
+    if(readcnt == 0) {
+        V(&w);
+    }
+    V(&mutex);
+    return return_flag;
+}
+
+void writer(char *url, char *buf) {
+    int cache_cnt = 0;
+    P(&w);
+
+    for(int i = 0; i < 10; i++) {
+        if(*(cache[i].flag) == 1 && !strcmp(cache[i].url, url)) {
+            cache_cnt = 1;
+            *(cache[i].cnt) = 0;
+            break;
+        }
+    }
+
+    if(cache_cnt == 0) {
+        int idx = 0;
+        int max_cnt = 0;
+        for(int i = 0; i < 10; i++) {
+            if(*(cache[i].flag) == 0) {
+                idx = i;
+                break;
+            }
+            if(*(cache[i].cnt) > max_cnt) {
+                idx = i;
+                max_cnt = *(cache[i].cnt);
+            }
+        }
+        *(cache[idx].flag) = 1;
+        strcpy(cache[idx].url, url);
+        strcpy(cache[idx].content, buf);
+        *(cache[idx].cnt) = 0;
+    }
+    for(int i = 0; i < 10; i++) {
+        (*(cache[i].cnt))++;
+    }
+    V(&w);
+}
